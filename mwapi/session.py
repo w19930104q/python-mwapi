@@ -22,7 +22,7 @@ import requests.exceptions
 from .errors import (APIError, ClientInteractionRequest, ConnectionError,
                      HTTPError, LoginError, RequestError, TimeoutError,
                      TooManyRedirectsError)
-from .util import _normalize_params
+from .util import _extract_pages, _merge_page, _normalize_params
 
 DEFAULT_USERAGENT = "mwapi (python) -- default user-agent"
 
@@ -210,6 +210,67 @@ class Session:
             # re-send all continue values in the next call
             params.update(doc['continue'])
             files = None  # Don't send files again
+
+    def pages(self, query_continue=None, auth=None, method="GET", **params):
+        """
+        Makes a query request and lazily yields batches of pages merged
+        across response documents.  Pages from consecutive responses are
+        merged together (by ``pageid`` for normal pages and by ``title``
+        for pages without an ID) until a response contains
+        ``batchcomplete`` or no ``continue`` field, at which point the
+        accumulated batch is yielded as a list of pages ordered by first
+        appearance.  Both formatversion=1 and formatversion=2 responses
+        are supported and produce the same list-of-pages output.  An
+        empty batch is yielded as an empty list.
+
+        Only the current batch is kept in memory and no further requests
+        are made once the caller stops consuming the generator.
+
+        :Parameters:
+            query_continue : `dict`
+                Optionally, the value of a query continuation 'continue'
+                field from a past request.
+            auth : mixed
+                Auth tuple or callable to enable Basic/Digest/Custom HTTP
+                Auth.
+            method : `str`
+                Which HTTP method to use for the requests
+                (usually "GET" or "POST").
+            params :
+                Keyword parameters to be sent with each request.
+
+        :Returns:
+            A generator of lists of merged page documents.
+
+        :Raises:
+            :class:`mwapi.errors.APIError` : if the API responds with an error
+        """
+        normal_params = _normalize_params(params, query_continue)
+        return self._page_batches(method, normal_params, auth=auth)
+
+    def _page_batches(self, method, params, auth=None):
+        base_params = dict(params)
+        if 'continue' not in base_params:
+            base_params['continue'] = ''
+
+        query_continue = None
+        batch = []
+        index = {}
+        while True:
+            request_params = dict(base_params)
+            if query_continue is not None:
+                # re-send only the latest continue values
+                request_params.update(query_continue)
+            doc = self._request(method, params=request_params, auth=auth)
+            for page in _extract_pages(doc):
+                _merge_page(batch, index, page)
+            query_continue = doc.get('continue')
+            if doc.get('batchcomplete') or query_continue is None:
+                yield batch
+                batch = []
+                index = {}
+            if query_continue is None:
+                break
 
     def login(self, username, password, login_token=None):
         """
